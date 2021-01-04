@@ -1,0 +1,468 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+
+Description: >-
+  This template deploys API gateway, CloudFront, S3 bucket website, WebACL, IPSet, LAMBDA Authorizer
+
+Parameters:
+  pEnvironmentTag:
+    Description: Environment Tag
+    Type: String
+  pTimeStamp:
+    Description: Timestamp to force custom resource updates
+    Type: String
+  pTokenExpMinutes:
+    Description: Number of minutes before token is removed from ddb
+    Type: Number
+  pOrmanSpacesBucketName:
+    Description: Bucket name to store OrmanSpaces that exceed 400kb
+    Type: String
+
+Resources:   
+
+  rAuthTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: "token"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "token"
+          KeyType: "HASH"
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification: 
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: "cleanup_time(TTL)"
+        Enabled: True
+      Tags:
+        - Key: Name
+          Value: !Sub '${pEnvironmentTag}-Auth-Token-DynamoDB-table'
+
+  rOrmanSpacesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: "namespace"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "namespace"
+          KeyType: "HASH"
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification: 
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${pEnvironmentTag}-OrmanSpaces-DynamoDB-table'
+
+  rTestView:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: >- 
+        LAMBDA token authorizer
+      Handler: test.handler
+      CodeUri: ./Backend-Lambdas/TestView/
+      Runtime: python3.6
+      Policies:
+      - Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Action:
+          - logs:*
+          Resource: 
+          - "arn:aws:logs:*:*:*"
+      Events:
+        OrmanSpacesAuthAPI:
+          Type: Api
+          Properties:
+            Path: /test
+            Method: get
+            RestApiId: !Ref rNamespaceAuthApi
+      Timeout: 180
+      Tags:
+        Name: !Sub '${pEnvironmentTag}-test-token-lambda-function'
+
+  rAuthorizer:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: >- 
+        LAMBDA token authorizer
+      Handler: authorizer.handler
+      CodeUri: ./Backend-Lambdas/Authorizer/
+      Runtime: python3.6
+      Timeout: 180
+      Policies:
+      - Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Action:
+          - dynamodb:GetItem
+          - dynamodb:DeleteItem
+          Resource: 
+          - !GetAtt rAuthTable.Arn
+        - Effect: Allow
+          Action:
+          - logs:*
+          Resource: 
+          - "arn:aws:logs:*:*:*"
+      Environment:
+        Variables:
+          AUTH_TABLE_NAME: !Ref rAuthTable
+          PORTAL_DOMAIN_NAME: '*'
+      Tags:
+        Name: !Sub '${pEnvironmentTag}-directory-admin-lambda'
+
+  rNamespaceAuth:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: >- 
+        Creates token for namespace authentication
+      Handler: NamespaceAuth.handler
+      CodeUri: ./Backend-Lambdas/NamespaceAuth/
+      Runtime: python3.6
+      Timeout: 180
+      Policies:
+      - Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Action:
+          - dynamodb:PutItem
+          - dynamodb:GetItem
+          - dynamodb:UpdateItem
+          Resource: 
+          - !GetAtt rAuthTable.Arn
+          - !GetAtt rOrmanSpacesTable.Arn
+        - Effect: Allow
+          Action:
+          - logs:*
+          Resource: 
+          - "arn:aws:logs:*:*:*"
+        - Effect: Allow
+          Action:
+          - s3:putObject
+          Resource: 
+          - arn:aws:s3:::${pOrmanSpacesBucketName}
+      Environment:
+        Variables:
+          AUTH_TABLE_NAME: !Ref rAuthTable
+          PORTAL_DOMAIN_NAME: '*'
+          TOKEN_EXP_MINUTES: !Ref pTokenExpMinutes
+          SPACES_TABLE_NAME: !Ref rOrmanSpacesTable
+      Events:
+        OrmanSpacesAuthAPI:
+          Type: Api
+          Properties:
+            Path: /auth
+            Method: post
+            RestApiId: !Ref rNamespaceAuthApi
+      Tags:
+        Name: !Sub '${pEnvironmentTag}-directory-admin-lambda'
+
+  rOrmanSpaces:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: >- 
+        Registers namespace
+      Handler: Namespace.handler
+      CodeUri: ./Backend-Lambdas/Namespace/
+      Runtime: python3.6
+      Timeout: 180
+      Policies:
+      - Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Action:
+          - dynamodb:PutItem
+          - dynamodb:GetItem
+          - dynamodb:UpdateItem
+          - dynamodb:DeleteItem
+          Resource: 
+          - !GetAtt rAuthTable.Arn
+          - !GetAtt rOrmanSpacesTable.Arn
+        - Effect: Allow
+          Action:
+          - logs:*
+          Resource: 
+          - "arn:aws:logs:*:*:*"
+        - Effect: Allow
+          Action:
+          - s3:*
+          Resource:  
+          - !Sub arn:aws:s3:::${pOrmanSpacesBucketName}
+          - !Sub arn:aws:s3:::${pOrmanSpacesBucketName}/*
+      Environment:
+        Variables:
+          AUTH_TABLE_NAME: !Ref rAuthTable
+          PORTAL_DOMAIN_NAME: '*'
+          TOKEN_EXP_MINUTES: !Ref pTokenExpMinutes
+          SPACES_TABLE_NAME: !Ref rOrmanSpacesTable
+          SPACES_BUCKET_NAME: !Ref pOrmanSpacesBucketName
+      Events:
+        OrmanSpacesAuthAPI:
+          Type: Api
+          Properties:
+            Path: /namespace
+            Method: post
+            RestApiId: !Ref rNamespaceAuthApi
+      Tags:
+        Name: !Sub '${pEnvironmentTag}-namespace-lambda'
+
+  rRegisterNamespace:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: >- 
+        Registers namespace
+      Handler: NamespaceRegistration.handler
+      CodeUri: ./Backend-Lambdas/NamespaceRegistration/
+      Runtime: python3.6
+      Timeout: 180
+      Policies:
+      - Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Action:
+          - dynamodb:PutItem
+          - dynamodb:GetItem
+          Resource: 
+          - !GetAtt rAuthTable.Arn
+          - !GetAtt rOrmanSpacesTable.Arn
+        - Effect: Allow
+          Action:
+          - logs:*
+          Resource: 
+          - "arn:aws:logs:*:*:*"
+      Environment:
+        Variables:
+          PORTAL_DOMAIN_NAME: '*'
+          SPACES_TABLE_NAME: !Ref rOrmanSpacesTable
+      Events:
+        OrmanSpacesAuthAPI:
+          Type: Api
+          Properties:
+            Path: /register
+            Method: post
+            RestApiId: !Ref rNamespaceAuthApi
+      Tags:
+        Name: !Sub '${pEnvironmentTag}-namespace-lambda'
+
+  rNamespaceAuthApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: dev
+      Auth:
+        Authorizers:
+          NameSpaceAuthorizer:
+            FunctionPayloadType: TOKEN
+            FunctionArn: !Sub arn:aws:lambda:us-east-1:${AWS::AccountId}:function:${rAuthorizer}
+            Identity:
+              Header: authorizationToken
+      DefinitionBody:
+        swagger: 2.0
+        info:
+          title: !Sub '${AWS::StackName}-Namespace-Api'
+        securityDefinitions:
+          NameSpaceAuthorizer:
+            type: "apiKey"
+            name: "authorizationToken"
+            in: "header"
+            x-amazon-apigateway-authtype: "custom"
+            x-amazon-apigateway-authorizer:
+              authorizerUri: !Sub "arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/${rAuthorizer.Arn}/invocations"
+              authorizerResultTtlInSeconds: 0
+              type: "token"
+        paths:
+          /register:
+            post:
+              responses:
+                "200":
+                  description: "200 response"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${rRegisterNamespace.Arn}/invocations'
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                passthroughBehavior: "when_no_match"
+                httpMethod: "POST"
+                contentHandling: "CONVERT_TO_TEXT"
+                type: "aws_proxy"
+            options:
+              consumes:
+              - "application/json"
+              responses:
+                "200":
+                  description: "200 response"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+                    Access-Control-Allow-Methods:
+                      type: "string"
+                    Access-Control-Allow-Headers:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+                      method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,authorizationToken'"
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                requestTemplates:
+                  application/json: "{\"statusCode\": 200}"
+                passthroughBehavior: "when_no_match"
+                type: "mock"
+ 
+          /namespace:
+            post:
+              responses:
+                "200":
+                  description: "200 response"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+              security:
+              - NameSpaceAuthorizer: []
+              x-amazon-apigateway-integration:
+                uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${rOrmanSpaces.Arn}/invocations'
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                passthroughBehavior: "when_no_match"
+                httpMethod: "POST"
+                contentHandling: "CONVERT_TO_TEXT"
+                type: "aws_proxy"
+            options:
+              consumes:
+              - "application/json"
+              responses:
+                "200":
+                  description: "200 response"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+                    Access-Control-Allow-Methods:
+                      type: "string"
+                    Access-Control-Allow-Headers:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+                      method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,authorizationToken'"
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                requestTemplates:
+                  application/json: "{\"statusCode\": 200}"
+                passthroughBehavior: "when_no_match"
+                type: "mock"
+          /auth:
+            post:
+              responses:
+                "200":
+                  description: "200 response"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${rNamespaceAuth.Arn}/invocations'
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                passthroughBehavior: "when_no_match"
+                httpMethod: "POST"
+                contentHandling: "CONVERT_TO_TEXT"
+                type: "aws_proxy"
+            options:
+              consumes:
+              - "application/json"
+              responses:
+                "200":
+                  description: "200 response"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+                    Access-Control-Allow-Methods:
+                      type: "string"
+                    Access-Control-Allow-Headers:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+                      method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,authorizationToken'"
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                requestTemplates:
+                  application/json: "{\"statusCode\": 200}"
+                passthroughBehavior: "when_no_match"
+                type: "mock"
+          /test:
+            get:
+              responses:
+                "200":
+                  description: "200 response"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+              security:
+              - NameSpaceAuthorizer: []
+              x-amazon-apigateway-integration:
+                uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${rTestView.Arn}/invocations'
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                passthroughBehavior: "when_no_match"
+                httpMethod: "POST"
+                contentHandling: "CONVERT_TO_TEXT"
+                type: "aws_proxy"
+            options:
+              consumes:
+              - "application/json"
+              responses:
+                "200":
+                  description: "200 response"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+                    Access-Control-Allow-Methods:
+                      type: "string"
+                    Access-Control-Allow-Headers:
+                      type: "string"          
+              x-amazon-apigateway-integration:
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+                      method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,authorizationToken'"
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                requestTemplates:
+                  application/json: "{\"statusCode\": 200}"
+                passthroughBehavior: "when_no_match"
+                type: "mock"
+        x-amazon-apigateway-gateway-responses:
+          DEFAULT_4XX:
+            responseParameters:
+              gatewayresponse.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+              gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,authorizationToken'"
+Outputs:
+  oOrmanSpacesEndpointURL:
+    Value: !Sub '${rNamespaceAuthApi}.execute-api.${AWS::Region}.amazonaws.com/dev'
+    Description: Endpoint URL for OrmanSpacesPythonClient config.yml
